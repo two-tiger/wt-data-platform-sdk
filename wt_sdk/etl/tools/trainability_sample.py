@@ -27,7 +27,7 @@ from ..stages.trainability import (
     _is_eligible_trainability_record,
     _is_incomplete_stream_request,
     _record_id,
-    _step_sort_key,
+    _step_id,
 )
 
 
@@ -63,7 +63,7 @@ def process_session(
         raise ValueError("session contains duplicate record IDs")
     if any(row.get("job_id") != job_id or row.get("session_id") != session_id for row in rows):
         raise ValueError("query returned rows outside the requested job/session")
-    session = tuple(sorted(rows, key=_step_sort_key))
+    session = tuple(sorted(rows, key=_step_id))
     patches = stage.transform_session(session, context)
     if not patches:
         raise ValueError("sampled session no longer has a completion marker")

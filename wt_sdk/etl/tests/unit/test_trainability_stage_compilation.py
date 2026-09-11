@@ -61,9 +61,11 @@ def test_trainability_stage_runs_inside_landing_pipeline():
     assert result.failures == ()
     assert result.successful_rows == MIN_SIDE_CHAIN_LENGTH + 1
     patches = {patch.record_id: patch.updates for patch in result.landing_patches}
+    # Landing patches are the actual final diff only: the tail's stored reward
+    # already equals the completion reward it is copied from, so the visible
+    # change is the trainable flip alone.
     assert set(patches) == {"row-tail"}
-    assert patches["row-tail"]["is_trainable"] is True
-    assert patches["row-tail"]["reward"] == 0.7
+    assert patches["row-tail"] == {"is_trainable": True}
 
 
 def test_sample_tool_process_session_runs_stage_and_agrees_with_patches():
@@ -86,6 +88,16 @@ def test_sample_tool_process_session_runs_stage_and_agrees_with_patches():
         code == "superseded_in_chain"
         for record_id, code in reason_codes.items()
         if record_id not in {"row-tail", "row-side"}
+    )
+    # The stage patch (before the pipeline's final-diff reduction) must carry
+    # the completion record's non-null reward onto the trainable tail.
+    tail_row = next(row for row in report["rows"] if row["id"] == "row-tail")
+    assert tail_row["trainability_diagnostics"]["stage_patch"] == {
+        "is_trainable": True,
+        "reward": 0.7,
+    }
+    assert (
+        tail_row["trainability_diagnostics"]["reward_source_record_id"] == "row-tail"
     )
 
 

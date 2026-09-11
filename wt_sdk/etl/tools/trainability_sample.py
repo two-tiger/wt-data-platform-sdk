@@ -7,21 +7,25 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import random
 from collections import Counter
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
+from ..policy import (
+    TrainabilityPolicy,
+    normalize_trainability_policy,
+    trainability_policy_from_env_value,
+)
 from ..stage import SessionKey, StageContext
 from ..stages.trainability import (
-    CLAUDE_FILTER_ENABLED,
     UpdateIsTrainableStage,
     _detect_trainable_record_ids,
     _has_non_200_status_code,
     _is_eligible_trainability_record,
     _is_incomplete_stream_request,
-    _is_trainability_downgrade_label_enabled,
     _record_id,
     _step_sort_key,
 )
@@ -31,7 +35,6 @@ REASONS = {
     "selected_chain_tail": "该链最终保留的链尾，且未被多链 session 的独立单步链规则排除。",
     "superseded_in_chain": "同链后续记录通过严格前缀延伸或回退替代了此记录。",
     "short_side_chain": "多链 session 中链长小于 20 的子链，被 stage 的短子链规则排除；不证明它是真实 subagent。",
-    "singleton_side_chain": "多链 session 中仅含一条记录的独立链，被 stage 的单步子链规则排除；不证明它是真实 subagent。",
     "non_200_status": "meta_json 顶层、env_state 或 telemetry 含显式非 200 状态码，先行排除。",
     "incomplete_stream_request": "流式请求缺少 finish_reason，先行排除。",
     "selected_max_eligible_step": "降级模式选择过滤非 200 后 step_id 最大的一条。",
@@ -39,7 +42,13 @@ REASONS = {
 }
 
 
-def process_session(rows: list[dict[str, Any]], job_id: str, session_id: str) -> dict[str, Any]:
+def process_session(
+    rows: list[dict[str, Any]],
+    job_id: str,
+    session_id: str,
+    *,
+    trainability_policy: TrainabilityPolicy = TrainabilityPolicy.NORMAL,
+) -> dict[str, Any]:
     """Apply the real stage and attach explanations without modifying input rows."""
     stage = UpdateIsTrainableStage()
     context = StageContext(
@@ -47,6 +56,7 @@ def process_session(rows: list[dict[str, Any]], job_id: str, session_id: str) ->
         pipeline_version=stage.version,
         session_key=SessionKey(job_id, session_id),
         stage_name=stage.name,
+        trainability_policy=trainability_policy,
     )
     ids = [_record_id(row) for row in rows]
     if len(set(ids)) != len(ids):
@@ -58,11 +68,11 @@ def process_session(rows: list[dict[str, Any]], job_id: str, session_id: str) ->
     if not patches:
         raise ValueError("sampled session no longer has a completion marker")
 
-    downgrade = _is_trainability_downgrade_label_enabled()
+    downgrade = context.trainability_policy is TrainabilityPolicy.DOWNGRADE
     diagnostics: dict[str, dict[str, Any]] = {}
     eligible = tuple(
         row for row in session
-        if _is_eligible_trainability_record(row, enabled=CLAUDE_FILTER_ENABLED)
+        if _is_eligible_trainability_record(row)
     )
     if not downgrade:
         explained_ids = _detect_trainable_record_ids(eligible, diagnostics=diagnostics)
@@ -77,7 +87,7 @@ def process_session(rows: list[dict[str, Any]], job_id: str, session_id: str) ->
         patch = patches[record_id]
         if _has_non_200_status_code(row):
             evidence = {"reason_code": "non_200_status"}
-        elif CLAUDE_FILTER_ENABLED and _is_incomplete_stream_request(row):
+        elif _is_incomplete_stream_request(row):
             evidence = {"reason_code": "incomplete_stream_request"}
         elif downgrade:
             evidence = {"reason_code": (
@@ -117,12 +127,16 @@ def sample_job(
     session_count: int,
     table: str,
     seed: int = 0,
+    trainability_policy: TrainabilityPolicy = TrainabilityPolicy.NORMAL,
 ) -> dict[str, Any]:
     """Sample completed IDs, then query every row of each selected session."""
     if not job_id.strip() or not table.strip():
         raise ValueError("job_id and table must not be empty")
     if session_count <= 0:
         raise ValueError("session_count must be positive")
+    effective_trainability_policy = normalize_trainability_policy(
+        trainability_policy
+    )
     job_filter = "job_id = '" + job_id.replace("'", "''") + "'"
     query_options = {
         "partition": job_id,
@@ -154,7 +168,12 @@ def sample_job(
                 filter_query=job_filter + " AND " + session_filter,
                 **query_options,
             )
-            result = process_session(rows, job_id, session_id)
+            result = process_session(
+                rows,
+                job_id,
+                session_id,
+                trainability_policy=effective_trainability_policy,
+            )
         except Exception as exc:
             result = {
                 "session_id": session_id,
@@ -192,7 +211,9 @@ def sample_job(
         "source_table": table,
         "stage_name": UpdateIsTrainableStage.name,
         "stage_version": UpdateIsTrainableStage.version,
-        "TRAINABILITY_DOWNGRADE_LABEL": _is_trainability_downgrade_label_enabled(),
+        "TRAINABILITY_DOWNGRADE_LABEL": (
+            effective_trainability_policy is TrainabilityPolicy.DOWNGRADE
+        ),
         "sampling": {
             "method": "seeded_random_without_replacement_from_sorted_completed_ids",
             "seed": seed,
@@ -237,6 +258,10 @@ def main() -> int:
     if args.session_count <= 0 or not args.job_id.strip():
         parser.error("--session-count must be positive and --job-id must not be empty")
 
+    trainability_policy = trainability_policy_from_env_value(
+        os.getenv("TRAINABILITY_DOWNGRADE_LABEL")
+    )
+
     from wt_sdk import WTGatewayClient
 
     with WTGatewayClient() as client:
@@ -246,6 +271,7 @@ def main() -> int:
             session_count=args.session_count,
             seed=args.seed,
             table=args.table or client.config.tables.landing_table,
+            trainability_policy=trainability_policy,
         )
     write_report(report, args.output)
     print(f"Exported {report['sessions_processed']} sessions to {args.output.resolve()}; "

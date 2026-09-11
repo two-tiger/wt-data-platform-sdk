@@ -13,12 +13,6 @@ from ..policy import TrainabilityPolicy
 from ..stage import ETLStage, Record, Session, SessionPatch, StageContext
 
 MIN_SIDE_CHAIN_LENGTH = 20
-CLAUDE_FILTER_ENABLED = os.getenv("CLAUDE_TRAINABILITY_FILTER", "true").strip().lower() in {
-    "1",
-    "true",
-    "yes",
-    "on",
-}
 
 
 class UpdateIsTrainableStage(ETLStage):
@@ -37,16 +31,16 @@ class UpdateIsTrainableStage(ETLStage):
     than append operations. In a multi-chain session, independent chains shorter
     than ``TRAINABILITY_MIN_SIDE_CHAIN_LENGTH`` records are treated as short side
     branches or subagents and are not trainable. A single-chain session is not
-    considered a side chain. Incomplete streaming requests with an empty finish reason and
-    rows whose top-level messages disagree with their original request are also
-    filtered. Filtering error rows does not prevent the remaining rows from
-    being processed. This stage copies the completion record's non-null
+    considered a side chain. Incomplete streaming requests with an empty finish
+    reason are filtered for every provider. Filtering error rows does not prevent
+    the remaining rows from being processed. This stage copies the completion
+    record's non-null
     ``reward`` to every selected row and assigns no semantic meaning to message
     contents.
     """
 
     name = "update_is_trainable"
-    version = "6"
+    version = "7"
     required_fields = (
         "id",
         "step_id",
@@ -70,7 +64,7 @@ class UpdateIsTrainableStage(ETLStage):
         eligible_records = tuple(
             record
             for record in session
-            if _is_eligible_trainability_record(record, enabled=CLAUDE_FILTER_ENABLED)
+            if _is_eligible_trainability_record(record)
         )
         if context.trainability_policy is TrainabilityPolicy.DOWNGRADE:
             max_step_record = max(eligible_records, key=_step_sort_key, default=None)
@@ -332,36 +326,94 @@ def _has_non_200_status_code(record: Record) -> bool:
 
 
 def _is_incomplete_stream_request(record: Record) -> bool:
-    metadata = _decode_json_object(record.get("meta_json"))
-    if metadata is None:
-        return False
-    request = _decode_json_object(metadata.get("request"))
-    stream = request.get("stream") if request is not None else metadata.get("stream")
-    if stream is not True:
-        return False
-    return metadata.get("finish_reason") in {None, "null"}
+    """Return whether any streaming request or response payload is incomplete.
 
+    Providers place request and response metadata in different shapes. Decode
+    nested JSON strings and inspect all nested objects, accepting both boolean
+    and string stream markers and both snake_case and camelCase finish-reason
+    keys. A stream with no finish reason at all is incomplete, as is a finish
+    reason represented by null, ``"null"``, or an empty string.
+    """
 
-def _is_eligible_trainability_record(record: Record, *, enabled: bool = True) -> bool:
-    return (
-        not _has_non_200_status_code(record)
-        and (
-            not enabled
-            or not _is_incomplete_stream_request(record)
-        )
+    payloads: list[object] = [record.get("meta_json"), record.get("response")]
+    if any(
+        key in record
+        for key in ("stream", "streaming", "finish_reason", "finishReason")
+    ):
+        payloads.append(record)
+    objects = tuple(
+        nested
+        for payload in payloads
+        for nested in _nested_json_objects(payload)
+    )
+    if not objects:
+        return False
+
+    if not any(
+        _is_truthy_flag(item.get("stream"))
+        or _is_truthy_flag(item.get("streaming"))
+        for item in objects
+    ):
+        return False
+
+    finish_reasons = [
+        item[key]
+        for item in objects
+        for key in ("finish_reason", "finishReason")
+        if key in item
+    ]
+    return not finish_reasons or any(
+        _is_empty_finish_reason(value) for value in finish_reasons
     )
 
 
-def _has_consistent_request_messages(record: Record) -> bool:
-    metadata = _decode_json_object(record.get("meta_json"))
-    request = _decode_json_object(metadata.get("request")) if metadata else None
-    if request is None or not isinstance(request.get("messages"), list):
+def _is_eligible_trainability_record(record: Record) -> bool:
+    """Return whether a row may participate in trainability selection."""
+
+    return not _has_non_200_status_code(record) and not _is_incomplete_stream_request(
+        record
+    )
+
+
+def _nested_json_objects(value: object) -> list[Mapping[str, object]]:
+    """Flatten nested mappings, decoding JSON-object strings on the way."""
+
+    decoded = _decode_json_object(value)
+    if decoded is None:
+        return []
+    objects: list[Mapping[str, object]] = [decoded]
+    for child in decoded.values():
+        if isinstance(child, Mapping):
+            objects.extend(_nested_json_objects(child))
+        elif isinstance(child, list):
+            for item in child:
+                if isinstance(item, (Mapping, str)):
+                    objects.extend(_nested_json_objects(item))
+        elif isinstance(child, str):
+            nested = _decode_json_object(child)
+            if nested is not None:
+                objects.extend(_nested_json_objects(nested))
+    return objects
+
+
+def _is_truthy_flag(value: object) -> bool:
+    if value is True:
         return True
-    record_id = _record_id(record)
-    if not all(isinstance(message, Mapping) for message in request["messages"]):
-        return False
-    messages = _decode_messages(record.get("messages"), record_id)
-    return _message_fingerprints(messages) == _message_fingerprints(request["messages"])
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value == 1
+    return isinstance(value, str) and value.strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _is_empty_finish_reason(value: object) -> bool:
+    return value is None or (
+        isinstance(value, str)
+        and value.strip().lower() in {"", "null"}
+    )
 
 
 def _decode_json_object(value: object) -> Mapping[str, object] | None:
